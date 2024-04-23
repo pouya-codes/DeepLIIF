@@ -1,0 +1,28 @@
+Bootstrap: docker
+From: nvidia/cuda:11.1.1-cudnn8-devel-ubuntu18.04
+Stage: spython-base
+
+%files
+cli.py cli.py
+deepliif deepliif
+setup.py setup.py
+README.md README.md
+%post
+# Use nvidia/cuda image
+
+apt-get update -y && \
+apt-get install -y \
+gcc git wget \
+ffmpeg libsm6 libxext6 default-jdk \
+python3.8 python3.8-dev python3-pip
+
+wget https://bootstrap.pypa.io/get-pip.py && python3.8 get-pip.py
+
+# install requirements for API
+
+pip install numpy==1.21.5
+pip install .
+%runscript
+exec /bin/bash "$@"
+%startscript
+exec /bin/bash "$@"

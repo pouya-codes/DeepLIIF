@@ -24,7 +24,7 @@ import sys
 
 excluding_names = ['Hema', 'DAPI', 'DAPILap2', 'Ki67', 'Seg', 'Marked', 'SegRefined', 'SegOverlaid', 'Marker', 'Lap2']
 # Image extensions to consider
-image_extensions = ['.png', '.jpg', '.tif', '.jpeg', '.svs']
+image_extensions = ['.png', '.jpg', '.tif', '.jpeg', '.svs', '.ndpi']
 
 
 def allowed_file(filename):

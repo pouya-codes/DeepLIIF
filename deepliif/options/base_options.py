@@ -11,7 +11,7 @@ def create_base_parser():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     # basic parameters
-    parser.add_argument('--dataroot', required=True,
+    parser.add_argument('--dataroot', required=False, default="./data",
                         help='path to images (should have subfolders trainA, trainB, valA, valB, etc)')
     parser.add_argument('--name', type=str, default='experiment_name',
                         help='name of the experiment. It decides where to store samples and models')

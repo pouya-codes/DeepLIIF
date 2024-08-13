@@ -13,6 +13,8 @@
     |
     <a href="https://onlinelibrary.wiley.com/share/author/4AEBAGEHSZE9GDP3H8MN?target=10.1111/his.15048">Histopathology'23</a>
     |
+    <a href="https://arxiv.org/abs/2405.08169">MICCAI'24</a>
+    |
     <a href="https://deepliif.org/">Cloud Deployment</a>
     |
     <a href="https://nadeemlab.github.io/DeepLIIF/">Documentation</a>
@@ -40,7 +42,7 @@ segmentation.*
 
 © This code is made available for non-commercial academic purposes.
 
-![Version](https://img.shields.io/static/v1?label=latest&message=v1.1.9&color=darkgreen)
+![Version](https://img.shields.io/static/v1?label=latest&message=v1.1.11&color=darkgreen)
 [![Total Downloads](https://static.pepy.tech/personalized-badge/deepliif?period=total&units=international_system&left_color=grey&right_color=blue&left_text=total%20downloads)](https://pepy.tech/project/deepliif?&left_text=totalusers)
 
 ![overview_image](./images/overview.png)*Overview of DeepLIIF pipeline and sample input IHCs (different 
@@ -86,6 +88,16 @@ Commands:
   serialize              Serialize DeepLIIF models using Torchscript
   test                   Test trained models
   train                  General-purpose training script for multi-task...
+```
+
+**Note:** You might need to install a version of PyTorch that is compatible with your CUDA version. 
+Otherwise, only the CPU will be used. 
+Visit the [PyTorch website](https://pytorch.org/) for details. 
+You can confirm if your installation will run on the GPU by checking if the following returns `True`:
+
+```
+import torch
+torch.cuda.is_available()
 ```
 
 ## Training Dataset
@@ -185,7 +197,7 @@ python test.py --dataroot /path/to/input/images
 * Before running test on images, the model files must be serialized as described above.
 * The serialized model files are expected to be located in `DeepLIIF/model-server/DeepLIIF_Latest_Model`.
 * The test results will be saved to the specified output directory, which defaults to the input directory.
-* The default tile size is 512.
+* The tile size must be specified and is used to split the image into tiles for processing.  The tile size is based on the resolution (scan magnification) of the input image, and the recommended values are a tile size of 512 for 40x images, 256 for 20x, and 128 for 10x.  Note that the smaller the tile size, the longer inference will take.
 * Testing datasets can be downloaded [here](https://zenodo.org/record/4751737#.YKRTS0NKhH4).
 
 **Whole Slide Image (WSI) Inference:**  
@@ -239,7 +251,7 @@ The plugin also supports submitting multiple ROIs at once:
 ## Cloud Deployment
 If you don't have access to GPU or appropriate hardware and don't want to install ImageJ, we have also created a [cloud-native DeepLIIF deployment](https://deepliif.org) with a user-friendly interface to upload images, visualize, interact, and download the final results.
 
-![DeepLIIF Website Demo](images/deepliif-website-demo-03.gif)
+![DeepLIIF Website Demo](images/deepliif-website-demo-04.gif)
 
 ## Cloud API Endpoints
 
@@ -537,5 +549,12 @@ If you find our work useful in your research or if you use parts of this code or
   journal = {Histopathology},
   year = {2023},
   doi = {https://doi.org/10.1111/his.15048}
+}
+
+@article{zehra2024deepliifstitch,
+author = {Zehra, Talat and Marino, Joseph and Wang, Wendy and Frantsuzov, Grigoriy and Nadeem, Saad},
+title = {Rethinking Histology Slide Digitization Workflows for Low-Resource Settings},
+journal = {International Conference on Medical Image Computing and Computer-Assisted Intervention (MICCAI)},
+year = {2024}
 }
 ```

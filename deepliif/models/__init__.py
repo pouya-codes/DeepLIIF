@@ -546,12 +546,12 @@ def inference(img, tile_size, overlap_size, model_path, use_torchserve=False,
         return results # return result images with default key names (i.e., net names)
 
 
-def postprocess(orig, images, tile_size, model, seg_thresh=150, size_thresh='auto', marker_thresh=None, size_thresh_upper=None):
+def postprocess(orig, images, tile_size, model, seg_thresh=150, size_thresh='auto', marker_thresh=None, size_thresh_upper=None, cell_classifier=None):
     if model == 'DeepLIIF':
         resolution = '40x' if tile_size > 384 else ('20x' if tile_size > 192 else '10x')
         overlay, refined, scoring = compute_results(np.array(orig), np.array(images['Seg']),
                                                     np.array(images['Marker'].convert('L')) if 'Marker' in images else None,
-                                                    resolution, seg_thresh, size_thresh, marker_thresh, size_thresh_upper)
+                                                    resolution, seg_thresh, size_thresh, marker_thresh, size_thresh_upper, cell_classifier= cell_classifier)
         processed_images = {}
         processed_images['SegOverlaid'] = Image.fromarray(overlay)
         processed_images['SegRefined'] = Image.fromarray(refined)
@@ -578,7 +578,7 @@ def postprocess(orig, images, tile_size, model, seg_thresh=150, size_thresh='aut
 
 
 def infer_modalities(img, tile_size, model_dir, eager_mode=False,
-                     color_dapi=False, color_marker=False, opt=None):
+                     color_dapi=False, color_marker=False, opt=None, cell_classifier=None):
     """
     This function is used to infer modalities for the given image using a trained model.
     :param img: The input image.
@@ -608,7 +608,7 @@ def infer_modalities(img, tile_size, model_dir, eager_mode=False,
     )
     
     if not hasattr(opt,'seg_gen') or (hasattr(opt,'seg_gen') and opt.seg_gen): # the first condition accounts for old settings of deepliif; the second refers to deepliifext models
-        post_images, scoring = postprocess(img, images, tile_size, opt.model)
+        post_images, scoring = postprocess(img, images, tile_size, opt.model, cell_classifier = cell_classifier)
         images = {**images, **post_images}
         return images, scoring
     else:

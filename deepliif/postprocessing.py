@@ -200,7 +200,8 @@ def mark_background(mask):
                 if in_bounds(mask, idx) and mask[idx] == MASK_UNKNOWN:
                     seeds.append(idx)
 
-def compute_cell_classification_modified(mask, marker, size_thresh, marker_thresh, size_thresh_upper = None, orig = None, cell_classifier = None):
+@jit(nopython=True)
+def compute_cell_classification_modified(mask, marker, size_thresh, marker_thresh, size_thresh_upper = None, orig = None, patch_classifier_mask = None):
     """
     Compute the mapping of the mask to positive and negative cell classification.
 
@@ -224,8 +225,7 @@ def compute_cell_classification_modified(mask, marker, size_thresh, marker_thres
     neighbors = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]
     border_neighbors = [(0, -1), (-1, 0), (1, 0), (0, 1)]
     positive_cell_count, negative_cell_count = 0, 0
-    cells_coords = []
-
+    # cells_coords = []
     for y in range(mask.shape[0]):
         for x in range(mask.shape[1]):
             if mask[y, x] == MASK_POSITIVE or mask[y, x] == MASK_NEGATIVE:
@@ -255,20 +255,32 @@ def compute_cell_classification_modified(mask, marker, size_thresh, marker_thres
                             count += 1
 
                 if count > size_thresh and (size_thresh_upper is None or count < size_thresh_upper):
-                    if cell_classifier is not None:
-                        cell_classifier_res, prop = cell_classifier.process_window(orig, cell_coords)
+                    if patch_classifier_mask is not None:
+                        size_points = len(cell_coords)
+                        sum_y = 0
+                        sum_x = 0
+                        for i in range(size_points):
+                            sum_y += cell_coords[i][0]
+                            sum_x += cell_coords[i][1]
+                        y = sum_y // size_points
+                        x = sum_x // size_points
+
+                        # y, x = np.mean(cell_coords, axis=0).astype(int)
+                        label = patch_classifier_mask[y, x] == 255
+                        
+                        # cell_classifier_res, prop = cell_classifier.process_window(orig, cell_coords)
                         # print(cell_classifier_res, prop)
 
-                    if (((count_positive/count_posneg) >= 0.5 or max_marker > marker_thresh) and cell_classifier_res == 0 and prop < 0.8) or (cell_classifier_res == 1 and prop > 0.90): 
+                    if ((count_positive/count_posneg) >= 0.5 or max_marker > marker_thresh) and label if patch_classifier_mask is not None else True: # and cell_classifier_res == 0 and prop < 0.8) or (cell_classifier_res == 1 and prop > 0.90): 
                         fill_value = MASK_CELL_POSITIVE
                         border_value = MASK_CELL_POSITIVE # MASK_BOUNDARY_POSITIVE
                         positive_cell_count += 1
-                        cells_coords.append(cell_coords)
+                        # cells_coords.append(cell_coords)
                     else:
                         fill_value = MASK_CELL_NEGATIVE
                         border_value = MASK_CELL_NEGATIVE # MASK_BOUNDARY_NEGATIVE
                         negative_cell_count += 1
-                        cells_coords.append(cell_coords)
+                        # cells_coords.append(cell_coords)
                 else:
                     fill_value = MASK_BACKGROUND
                     border_value = MASK_BACKGROUND
@@ -290,7 +302,7 @@ def compute_cell_classification_modified(mask, marker, size_thresh, marker_thres
         'num_pos': positive_cell_count,
         'num_neg': negative_cell_count,
     }
-    return counts, cells_coords
+    return counts, None
 
 
 @jit(nopython=True)
@@ -493,7 +505,7 @@ def calc_default_marker_thresh(marker):
         return 0
 
 
-def compute_results(orig, seg, marker, resolution=None, seg_thresh=150, size_thresh='auto', marker_thresh='auto', size_thresh_upper=None, cell_classifier=None):
+def compute_results(orig, seg, marker, resolution=None, seg_thresh=150, size_thresh='auto', marker_thresh='auto', size_thresh_upper=None, patch_classifier_mask=None):
     mask = create_posneg_mask(seg, seg_thresh)
     mark_background(mask)
 
@@ -504,13 +516,14 @@ def compute_results(orig, seg, marker, resolution=None, seg_thresh=150, size_thr
         marker = None
     elif marker_thresh == 'auto':
         marker_thresh = calc_default_marker_thresh(marker)
-    if cell_classifier is not None:
-        counts, cell_coords = compute_cell_classification_modified(mask, marker, size_thresh, marker_thresh, size_thresh_upper, orig = orig, cell_classifier = cell_classifier)
+    if patch_classifier_mask is not None:
+        patch_classifier_mask = np.array(patch_classifier_mask)
+        counts, cell_coords = compute_cell_classification_modified(mask, marker, size_thresh, marker_thresh, size_thresh_upper, orig = orig, patch_classifier_mask = patch_classifier_mask)
     else:
         counts = compute_cell_classification(mask, marker, size_thresh, marker_thresh, size_thresh_upper)
         cell_coords = None
 
-    counts = compute_cell_classification(mask, marker, size_thresh, marker_thresh, size_thresh_upper)
+    # counts = compute_cell_classification(mask, marker, size_thresh, marker_thresh, size_thresh_upper)
     enlarge_cell_boundaries(mask)
 
     scoring = {
@@ -534,5 +547,4 @@ def compute_results(orig, seg, marker, resolution=None, seg_thresh=150, size_thr
     refined[mask == MASK_CELL_NEGATIVE, 2] = 255
     refined[mask == MASK_BOUNDARY_POSITIVE, 1] = 255
     refined[mask == MASK_BOUNDARY_NEGATIVE, 1] = 255
-
     return overlay, refined, scoring

@@ -253,9 +253,16 @@ If you don't have access to GPU or appropriate hardware and don't want to instal
 
 ![DeepLIIF Website Demo](images/deepliif-website-demo-04.gif)
 
+Our deployment at [deepliif.org](https://deepliif.org) also provides virtual slide digitization to generate a single stitched image from a 10x video acquired with a microscope and camera.  The video should be captured with the following guidelines to achieve the best results:
+* Brief but complete pauses at every section of the sample to avoid motion artifacts.
+* Significant overlap between pauses so that there is sufficient context for stitching frames together.
+* Methodical and consistent movement over the sample.  For example, start at the top left corner, then go all the way to the right, then down one step, then all the way to the left, down one step, etc., until the end of the sample is reached.  Again, brief overlapping pauses throughout will allow the best quality images to be generated.
+
+![DeepLIIF Website Demo](images/deepliif-stitch-demo-01.gif)
+
 ## Cloud API Endpoints
 
-DeepLIIF can also be accessed programmatically through an endpoint by posting a multipart-encoded request containing the original image file, along with optional parameters including postprocessing thresholds:
+For small images, DeepLIIF can also be accessed programmatically through an endpoint by posting a multipart-encoded request containing the original image file, along with optional parameters including postprocessing thresholds:
 
 ```
 POST /api/infer
@@ -350,6 +357,8 @@ with open(f'{images_dir}/{root}_scoring.json', 'w') as f:
     json.dump(data['scoring'], f, indent=2)
 print(json.dumps(data['scoring'], indent=2))
 ```
+
+Note that since this is a single request to send the image and receive the results, processing must complete within the timeout period (typically about one minute).  If your request is receiving a 504 status code, please try a smaller image or install the `deepliif` package as detailed above to run the process locally.
 
 If you have previously run DeepLIIF on an image and want to postprocess it with different thresholds, the postprocessing routine can be called directly using the previously inferred results:
 
@@ -503,16 +512,17 @@ DeepLIIF model and release back to the community with full credit to the contrib
 - [x] **Moffitt Cancer Center** [AI-ready multiplex immunofluorescence and multiplex immunohistochemistry dataset](https://wiki.cancerimagingarchive.net/pages/viewpage.action?pageId=70226184) for head-and-neck squamous cell carcinoma (**MICCAI'23**)   
 
 ## Support
-Please use the [Image.sc Forum](https://forum.image.sc/tag/deepliif) for discussion and questions related to DeepLIIF.
-
-Bugs can be reported in the [GitHub Issues](https://github.com/nadeemlab/DeepLIIF/issues) tab.
+Please use the [GitHub Issues](https://github.com/nadeemlab/DeepLIIF/issues) tab for discussion, questions, or to report bugs related to DeepLIIF.
 
 ## License
 © [Nadeem Lab](https://nadeemlab.org/) - DeepLIIF code is distributed under **Apache 2.0 with Commons Clause** license, 
 and is available for non-commercial academic purposes. 
 
 ## Acknowledgments
-* This code is inspired by [CycleGAN and pix2pix in PyTorch](https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix).
+This code is inspired by [CycleGAN and pix2pix in PyTorch](https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix).
+
+## Funding
+This work is funded by the 7-year NIH/NCI R37 MERIT Award ([R37CA295658](https://reporter.nih.gov/search/5dgSOlHosEKepkZEAS5_kQ/project-details/11018883#description)).
 
 ## Reference
 If you find our work useful in your research or if you use parts of this code or our released dataset, please cite the following papers:
@@ -540,6 +550,8 @@ If you find our work useful in your research or if you use parts of this code or
   title={An AI-Ready Multiplex Staining Dataset for Reproducible and Accurate Characterization of Tumor Immune Microenvironment},
   author={Ghahremani, Parmida and Marino, Joseph and Hernandez-Prera, Juan and V. de la Iglesia, Janis and JC Slebos, Robbert and H. Chung, Christine and Nadeem, Saad},
   journal={International Conference on Medical Image Computing and Computer-Assisted Intervention (MICCAI)},
+  volume={14225},
+  pages={704--713},
   year={2023}
 }
 
@@ -547,14 +559,19 @@ If you find our work useful in your research or if you use parts of this code or
   author = {Nadeem, Saad and Hanna, Matthew G and Viswanathan, Kartik and Marino, Joseph and Ahadi, Mahsa and Alzumaili, Bayan and Bani, Mohamed-Amine and Chiarucci, Federico and Chou, Angela and De Leo, Antonio and Fuchs, Talia L and Lubin, Daniel J and Luxford, Catherine and Magliocca, Kelly and Martinez, Germán and Shi, Qiuying and Sidhu, Stan and Al Ghuzlan, Abir and Gill, Anthony J and Tallini, Giovanni and Ghossein, Ronald and Xu, Bin},
   title = {Ki67 proliferation index in medullary thyroid carcinoma: a comparative study of multiple counting methods and validation of image analysis and deep learning platforms},
   journal = {Histopathology},
+  volume = {83},
+  number = {6},
+  pages = {981--988},
   year = {2023},
   doi = {https://doi.org/10.1111/his.15048}
 }
 
 @article{zehra2024deepliifstitch,
-author = {Zehra, Talat and Marino, Joseph and Wang, Wendy and Frantsuzov, Grigoriy and Nadeem, Saad},
-title = {Rethinking Histology Slide Digitization Workflows for Low-Resource Settings},
-journal = {International Conference on Medical Image Computing and Computer-Assisted Intervention (MICCAI)},
-year = {2024}
+  author = {Zehra, Talat and Marino, Joseph and Wang, Wendy and Frantsuzov, Grigoriy and Nadeem, Saad},
+  title = {Rethinking Histology Slide Digitization Workflows for Low-Resource Settings},
+  journal = {International Conference on Medical Image Computing and Computer-Assisted Intervention (MICCAI)},
+  volume = {15004},
+  pages = {427--436},
+  year = {2024}
 }
 ```

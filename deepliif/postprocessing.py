@@ -1111,11 +1111,15 @@ def create_final_images(overlay, mask):
     for y in range(mask.shape[0]):
         for x in range(mask.shape[1]):
             if mask[y, x] == LABEL_BORDER_POS:
+                # overlay[y, x] = (255, 0, 0)
+                # refined[y, x, 1] = 255
                 overlay[y, x] = (255, 0, 0)
-                refined[y, x, 1] = 255
+                refined[y, x, 0] = 255
             elif mask[y, x] == LABEL_BORDER_NEG:
+                # overlay[y, x] = (0, 0, 255)
+                # refined[y, x, 1] = 255
                 overlay[y, x] = (0, 0, 255)
-                refined[y, x, 1] = 255
+                refined[y, x, 2] = 255
             elif mask[y, x] == LABEL_POSITIVE:
                 refined[y, x, 0] = 255
             elif mask[y, x] == LABEL_NEGATIVE:

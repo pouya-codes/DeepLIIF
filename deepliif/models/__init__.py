@@ -25,6 +25,8 @@ from functools import lru_cache
 from io import BytesIO
 import json
 import math
+import importlib.metadata
+import pathlib
 
 import requests
 import torch
@@ -33,12 +35,11 @@ Image.MAX_IMAGE_PIXELS = None
 
 import numpy as np
 from dask import delayed, compute
-import openslide
 
 from deepliif.util import *
 from deepliif.util.util import tensor_to_pil
 from deepliif.data import transform
-from deepliif.postprocessing import compute_final_results, compute_cell_results
+from deepliif.postprocessing import compute_final_results, compute_cell_results, to_array
 from deepliif.postprocessing import encode_cell_data_v4, decode_cell_data_v4
 from deepliif.options import Options, print_options
 
@@ -132,7 +133,7 @@ def load_eager_models(opt, devices=None):
         model_names = list(devices.keys())
     else:
         model_names = model.model_names
-    
+
     for name in model_names:#model.model_names:
         if isinstance(name, str):
             if '_' in name:
@@ -154,7 +155,6 @@ def load_eager_models(opt, devices=None):
             
     return nets
 
-
 @lru_cache
 def init_nets(model_dir, eager_mode=False, opt=None, phase='test'):
     """
@@ -168,14 +168,23 @@ def init_nets(model_dir, eager_mode=False, opt=None, phase='test'):
         opt = get_opt(model_dir, mode=phase)
     opt.use_dp = False
     
-    if opt.model == 'DeepLIIF':
-        net_groups = [
-            ('G1', 'G52'),
-            ('G2', 'G53'),
-            ('G3', 'G54'),
-            ('G4', 'G55'),
-            ('G51',)
-        ]
+    # get l_net_groups: a list of lists, each sublist is a candidate, ordered by priority (try 1st, if fail try 2nd, etc.)
+    if opt.model in ['DeepLIIF','DeepLIIFKD']:
+        # net_groups = [
+        #     ('G1', 'G52'),
+        #     ('G2', 'G53'),
+        #     ('G3', 'G54'),
+        #     ('G4', 'G55'),
+        #     ('G51',)
+        # ]
+        if opt.modalities_no == 0:
+            net_groups = [(f'G{opt.mod_id_seg}{opt.input_id}',)]
+        else:
+            if opt.seg_gen:
+                net_groups = [(f'G{i+1}', f'G{opt.mod_id_seg}{int(opt.input_id)+i+1}') for i in range(opt.modalities_no)]
+                net_groups += [(f'G{opt.mod_id_seg}{opt.input_id}',)] # this is the generator for the input base mod
+            else:
+                net_groups = [(f'G{i+1}',) for i in range(opt.modalities_no)]
     elif opt.model in ['DeepLIIFExt','SDG']:
         if opt.seg_gen:
             net_groups = [(f'G_{i+1}',f'GS_{i+1}') for i in range(opt.modalities_no)]
@@ -196,8 +205,8 @@ def init_nets(model_dir, eager_mode=False, opt=None, phase='test'):
         mapping_gpu_ids = {i:idx for i,idx in enumerate(opt.gpu_ids)}
         chunks = [itertools.chain.from_iterable(c) for c in chunker(net_groups, number_of_gpus)]
         # chunks = chunks[1:]
-        devices = {n: torch.device(f'cuda:{mapping_gpu_ids[i]}') for i, g in enumerate(chunks) for n in g}
-        # devices = {n: torch.device(f'cuda:{i}') for i, g in enumerate(chunks) for n in g}
+        #l_devices = [{n: torch.device(f'cuda:{mapping_gpu_ids[i]}') for i, g in enumerate(chunks) for n in g} for chunks in l_chunks]
+        devices = {n: torch.device(f'cuda:{i}') for i, g in enumerate(chunks) for n in g}
     else:
         devices = {n: torch.device('cpu') for n in itertools.chain.from_iterable(net_groups)}
 
@@ -218,13 +227,16 @@ def compute_overlap(img_size, tile_size):
     return tile_size // 4
 
 
-def run_torchserve(img, model_path=None, eager_mode=False, opt=None, seg_only=False):
+def run_torchserve(img, model_path=None, nets=None, eager_mode=False, opt=None, seg_only=False, mod_only=False, seg_weights=None, use_dask=True, output_tensor=False):
     """
     eager_mode: not used in this function; put in place to be consistent with run_dask
            so that run_wrapper() could call either this function or run_dask with
            same syntax
     opt: same as eager_mode
     seg_only: same as eager_mode
+    mod_only: same as eager_mode
+    seg_weights: same as eager_mode
+    nets: same as eager_mode
     """
     buffer = BytesIO()
     torch.save(transform(img.resize((opt.scale_size, opt.scale_size))), buffer)
@@ -243,59 +255,108 @@ def run_torchserve(img, model_path=None, eager_mode=False, opt=None, seg_only=Fa
     return {k: tensor_to_pil(deserialize_tensor(v)) for k, v in res.json().items()}
 
 
-def run_dask(img, model_path, eager_mode=False, opt=None, seg_only=False):
-    model_dir = os.getenv('DEEPLIIF_MODEL_DIR', model_path)
-    nets = init_nets(model_dir, eager_mode, opt)
-    use_dask = True if opt.norm != 'spectral' else False
+def run_dask(img, model_path=None, nets=None, eager_mode=False, opt=None, seg_only=False, mod_only=False,
+             seg_weights=None, use_dask=True, output_tensor=False):
+    """
+    Provide either the model path or the networks object.
     
-    if opt.input_no > 1 or opt.model == 'SDG':
-        l_ts = [transform(img_i.resize((opt.scale_size,opt.scale_size))) for img_i in img]
-        ts = torch.cat(l_ts, dim=1)
+    `eager_mode` is only applicable if model_path is provided.
+    """
+    assert model_path is not None or nets is not None, 'Provide either the model path or the networks object.'
+    if nets is None:
+        model_dir = os.getenv('DEEPLIIF_MODEL_DIR', model_path)
+        nets = init_nets(model_dir, eager_mode, opt)
+    
+    if use_dask: # check if use_dask should be overwritten
+        use_dask = True if opt.norm != 'spectral' else False
+    
+    if isinstance(img,torch.Tensor): # if img input is already a tensor, pass
+        ts = img
     else:
-        ts = transform(img.resize((opt.scale_size, opt.scale_size)))
+        if opt.input_no > 1 or opt.model == 'SDG':
+            l_ts = [transform(img_i.resize((opt.scale_size,opt.scale_size))) for img_i in img]
+            ts = torch.cat(l_ts, dim=1)
+        else:
+            ts = transform(img.resize((opt.scale_size, opt.scale_size)))
     
-
+    
     if use_dask:
         @delayed
         def forward(input, model):
             with torch.no_grad():
                 return model(input.to(next(model.parameters()).device))
-    else: # some train settings like spectral norm some how in inference mode is not compatible with dask
+    else: # some train settings like spectral norm somehow in inference mode is not compatible with dask
         def forward(input, model):
             with torch.no_grad():
                 return model(input.to(next(model.parameters()).device))
     
-    if opt.model == 'DeepLIIF':
-        weights = {
-            'G51': 0.25, # IHC
-            'G52': 0.25, # Hema
-            'G53': 0.25, # DAPI
-            'G54': 0.00, # Lap2
-            'G55': 0.25, # Marker
-        }
-
-        seg_map = {'G1': 'G52', 'G2': 'G53', 'G3': 'G54', 'G4': 'G55'}
-        if seg_only:
-            seg_map = {k: v for k, v in seg_map.items() if weights[v] != 0}
+    if opt.model in ['DeepLIIF','DeepLIIFKD']:
         
+        # for seg_gen False, we also use this seg_map dictionary - only the keys though
+        seg_map = {f'G{i+1}': f'G{opt.mod_id_seg}{int(opt.input_id)+i+1}' for i in range(opt.modalities_no)}
+
+        if opt.seg_gen:
+            if seg_weights is None:
+                # weights = {
+                #     'G51': 0.5, # IHC
+                #     'G52': 0.0, # Hema
+                #     'G53': 0.0, # DAPI
+                #     'G54': 0.0, # Lap2
+                #     'G55': 0.5, # Marker
+                # }
+                weights = {f'G{opt.mod_id_seg}{int(opt.input_id)+i}': 1/(opt.modalities_no+1) for i in range(opt.modalities_no+1)}
+            else:
+                # weights = {
+                #     'G51': seg_weights[0], # IHC
+                #     'G52': seg_weights[1], # Hema
+                #     'G53': seg_weights[2], # DAPI
+                #     'G54': seg_weights[3], # Lap2
+                #     'G55': seg_weights[4], # Marker
+                # }
+                weights = {f'G{opt.mod_id_seg}{int(opt.input_id)+i}': seg_weight for i,seg_weight in enumerate(seg_weights)}
+            
+            if seg_only:
+                seg_map = {k: v for k, v in seg_map.items() if weights[v] != 0}
+            
         lazy_gens = {k: forward(ts, nets[k]) for k in seg_map}
-        if 'G4' not in seg_map:
-            lazy_gens['G4'] = forward(ts, nets['G4'])
+        if 'Marker' in opt.modalities_names:
+            mod_id_marker = opt.modalities_names.index("Marker")
+            if f'G{mod_id_marker}' not in seg_map:
+                lazy_gens[f'G{mod_id_marker}'] = forward(ts, nets[f'G{mod_id_marker}'])
+        
         gens = compute(lazy_gens)[0]
         
-        lazy_segs = {v: forward(gens[k], nets[v]).to(torch.device('cpu')) for k, v in seg_map.items()}
-        if not seg_only or weights['G51'] != 0:
-            lazy_segs['G51'] = forward(ts, nets['G51']).to(torch.device('cpu'))
-        segs = compute(lazy_segs)[0]
-    
-        seg = torch.stack([torch.mul(segs[k], weights[k]) for k in segs.keys()]).sum(dim=0)
-    
-        if seg_only:
-            res = {'G4': tensor_to_pil(gens['G4'])} if 'G4' in gens else {}
+        if opt.seg_gen and not mod_only:
+            lazy_segs = {v: forward(gens[k], nets[v]) for k, v in seg_map.items()}
+            # run seg generator for the base input
+            if weights[f'G{opt.mod_id_seg}{opt.input_id}'] != 0:
+                lazy_segs[f'G{opt.mod_id_seg}{opt.input_id}'] = forward(ts, nets[f'G{opt.mod_id_seg}{opt.input_id}'])
+            segs = compute(lazy_segs)[0]
+        
+            model_name_first = list(nets.keys())[0]
+            device = next(nets[model_name_first].parameters()).device # take the device of the first net and move all outputs there for seg aggregation
+            seg = torch.stack([torch.mul(segs[k].to(device), weights[k]) for k in segs.keys()]).sum(dim=0)
+        
+        if output_tensor:
+            if mod_only or not opt.seg_gen:
+                res = gens
+            elif seg_only and opt.modalities_no > 0:
+                res = {f'G{opt.modalities_no}': gens[f'G{opt.modalities_no}']} if f'G{opt.modalities_no}' in gens else {}
+                res[f'G{opt.mod_id_seg}'] = seg
+            else:
+                res = {**gens, **segs}
+                res[f'G{opt.mod_id_seg}'] = seg
+            
         else:
-            res = {k: tensor_to_pil(v) for k, v in gens.items()}
-            res.update({k: tensor_to_pil(v) for k, v in segs.items()})
-        res['G5'] = tensor_to_pil(seg)
+            if mod_only or not opt.seg_gen:
+                res = {k: tensor_to_pil(v.to(torch.device('cpu'))) for k, v in gens.items()}
+            elif seg_only and opt.modalities_no > 0:
+                res = {f'G{opt.modalities_no}': tensor_to_pil(gens[f'G{opt.modalities_no}'].to(torch.device('cpu')))} if f'G{opt.modalities_no}' in gens else {}
+                res[f'G{opt.mod_id_seg}'] = tensor_to_pil(seg.to(torch.device('cpu')))
+            else:
+                res = {k: tensor_to_pil(v.to(torch.device('cpu'))) for k, v in gens.items()}
+                res.update({k: tensor_to_pil(v.to(torch.device('cpu'))) for k, v in segs.items()})
+                res[f'G{opt.mod_id_seg}'] = tensor_to_pil(seg.to(torch.device('cpu')))
     
         return res
     elif opt.model in ['DeepLIIFExt','SDG','CycleGAN']:
@@ -311,6 +372,8 @@ def run_dask(img, model_path, eager_mode=False, opt=None, seg_only=False):
             gens = {k: forward(ts, nets[k]) for k in seg_map}
         
         res = {k: tensor_to_pil(v) for k, v in gens.items()}
+        if mod_only:
+            return res
     
         if opt.seg_gen:
             if use_dask:
@@ -326,65 +389,103 @@ def run_dask(img, model_path, eager_mode=False, opt=None, seg_only=False):
 
 
 def is_empty(tile):
-    thresh = 15
+    thresh = 9
     if isinstance(tile, list): # for pair of tiles, only mark it as empty / no need for prediction if ALL tiles are empty
-        return all([True if np.max(image_variance_rgb(t)) < thresh else False for t in tile])
+        return all([True if image_variance_gray(t) < thresh else False for t in tile])
     else:
-        return True if np.max(image_variance_rgb(tile)) < thresh else False
+        return True if image_variance_gray(tile) < thresh else False
 
 
-def run_wrapper(tile, run_fn, model_path, eager_mode=False, opt=None, seg_only=False):
-    if opt.model == 'DeepLIIF':
+def run_wrapper(tile, run_fn, model_path=None, nets=None, eager_mode=False, opt=None, seg_only=False, mod_only=False, seg_weights=None, use_dask=True, output_tensor=False):
+    if opt.model in ['DeepLIIF','DeepLIIFKD']:
         if is_empty(tile):
-            if seg_only:
-                return {
-                    'G4': Image.new(mode='RGB', size=(512, 512), color=(10, 10, 10)),
-                    'G5': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
-                }
+            if seg_only: # return seg image and the last translated modality
+                if opt.modalities_no >= 1:
+                    res = {
+                        #f'G{opt.modalities_no}': Image.new(mode='RGB', size=(512, 512), color=(10, 10, 10)),
+                        f'G{opt.modalities_no}': Image.new(mode='RGB', size=(512, 512), color=opt.background_colors[-1]),
+                        f'G{opt.mod_id_seg}': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
+                    }
+                else:
+                    res = {
+                        f'G{opt.mod_id_seg}': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
+                    }
+            elif mod_only or not opt.seg_gen:
+                res = {f'G{i+1}': Image.new(mode='RGB', size=(512, 512), color=opt.background_colors[i]) for i in range(opt.modalities_no)}
+                
             else :
-                return {
-                    'G1': Image.new(mode='RGB', size=(512, 512), color=(201, 211, 208)),
-                    'G2': Image.new(mode='RGB', size=(512, 512), color=(10, 10, 10)),
-                    'G3': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
-                    'G4': Image.new(mode='RGB', size=(512, 512), color=(10, 10, 10)),
-                    'G5': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
-                    'G51': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
-                    'G52': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
-                    'G53': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
-                    'G54': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
-                    'G55': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
-                }
+                # return {
+                #     'G1': Image.new(mode='RGB', size=(512, 512), color=(201, 211, 208)),
+                #     'G2': Image.new(mode='RGB', size=(512, 512), color=(10, 10, 10)),
+                #     'G3': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
+                #     'G4': Image.new(mode='RGB', size=(512, 512), color=(10, 10, 10)),
+                #     'G5': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
+                #     'G51': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
+                #     'G52': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
+                #     'G53': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
+                #     'G54': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
+                #     'G55': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)),
+                # }
+                res = {**{f'G{i+1}': Image.new(mode='RGB', size=(512, 512), color=opt.background_colors[i]) for i in range(opt.modalities_no)},
+                       **{f'G{opt.mod_id_seg}': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0))}}
+                
+                # assign mod-wise seg output to corresponding keys, again currently input_id only supports 0 or 1
+                if opt.input_id == 1:
+                    res = {**res,
+                           **{f'G{opt.mod_id_seg}{i+1}': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)) for i in range(opt.modalities_no+1)}}
+                else:
+                    res = {**res,
+                           **{f'G{opt.mod_id_seg}{i}': Image.new(mode='RGB', size=(512, 512), color=(0, 0, 0)) for i in range(opt.modalities_no+1)}}
+
+            # when modalities_no = 0... we do not need to generate G0 - output should be just a seg image
+            if 'G0' in res:
+                del res['G0']
+            return res
         else:
-            return run_fn(tile, model_path, eager_mode, opt, seg_only)
+            return run_fn(tile, model_path, None, eager_mode, opt, seg_only, mod_only, seg_weights)
     elif opt.model in ['DeepLIIFExt', 'SDG']:
         if is_empty(tile):
             res = {'G_' + str(i): Image.new(mode='RGB', size=(512, 512)) for i in range(1, opt.modalities_no + 1)}
             res.update({'GS_' + str(i): Image.new(mode='RGB', size=(512, 512)) for i in range(1, opt.modalities_no + 1)})
             return res
         else:
-            return run_fn(tile, model_path, eager_mode, opt)
+            return run_fn(tile, model_path, None, eager_mode, opt)
     elif opt.model in ['CycleGAN']:
         if is_empty(tile):
             net_names = ['GB_{i+1}' for i in range(opt.modalities_no)] if opt.BtoA else [f'GA_{i+1}' for i in range(opt.modalities_no)]
             res = {net_name: Image.new(mode='RGB', size=(512, 512)) for net_name in net_names}
             return res
         else:
-            return run_fn(tile, model_path, eager_mode, opt)
+            return run_fn(tile, model_path, None, eager_mode, opt)
     else:
         raise Exception(f'run_wrapper() not implemented for model {opt.model}')
 
 
 def inference(img, tile_size, overlap_size, model_path, use_torchserve=False,
               eager_mode=False, color_dapi=False, color_marker=False, opt=None,
-              return_seg_intermediate=False, seg_only=False):
+              return_seg_intermediate=False, seg_only=False, mod_only=False,
+              seg_weights=None, opt_args={}):
+    """
+    opt_args: a dictionary of key and values to add/overwrite to opt
+    """
     if not opt:
         opt = get_opt(model_path)
         #print_options(opt)
+    
+    for k,v in opt_args.items():
+        setattr(opt,k,v)
+    #print_options(opt)
+    
+    if hasattr(opt,'seg_gen') and opt.seg_gen == False:
+        if seg_only == True or return_seg_intermediate == True:
+            seg_only = False
+            return_seg_intermediate = False
+            print('option seg_gen is False, disabled seg_only and return_seg_intermediate')
 
     run_fn = run_torchserve if use_torchserve else run_dask
 
-    if opt.model == 'SDG':
-        # SDG could have multiple input images/modalities, hence the input could be a rectangle.
+    if opt.input_no > 1 or opt.model == 'SDG':
+        # models such as SDG could have multiple input images/modalities, hence the input could be a rectangle.
         # We split the input to get each modality image then create tiles for each set of input images.
         w, h = int(img.width / opt.input_no), img.height
         orig = [img.crop((w * i, 0, w * (i+1), h)) for i in range(opt.input_no)]
@@ -394,40 +495,73 @@ def inference(img, tile_size, overlap_size, model_path, use_torchserve=False,
 
     tiler = InferenceTiler(orig, tile_size, overlap_size)
     for tile in tiler:
-        tiler.stitch(run_wrapper(tile, run_fn, model_path, eager_mode, opt, seg_only))
+        tiler.stitch(run_wrapper(tile, run_fn, model_path, None, eager_mode, opt, seg_only, mod_only, seg_weights))
+        
     results = tiler.results()
-
-    if opt.model == 'DeepLIIF':
+    
+    if opt.model in ['DeepLIIF','DeepLIIFKD']:
+        # check if both the elements and the order are exactly the same
+        l_modname = [f'mod{i+1}' for i in range(opt.modalities_no)]
+        if l_modname != opt.modalities_names[opt.input_no:]: 
+            # if not, append modalities_names to mod names
+            l_modname = [f'mod{i+1}-{mod_name}' for i,mod_name in enumerate(opt.modalities_names[opt.input_no:])]
+        d_modname2id = {mod_name:f'G{i+1}' for i,mod_name in enumerate(l_modname)}        
+        
+        if opt.seg_gen:
+            l_modname_seg = [f'mod{i}' for i in range(opt.modalities_no+1)]
+            if l_modname_seg != opt.modalities_names: 
+                # if not, append modalities_names to mod names
+                l_modname_seg = [f'mod{i}-{mod_name}' for i,mod_name in enumerate(opt.modalities_names)]
+            if f'G{opt.mod_id_seg}0' in results.keys():
+                d_modname2id_seg = {mod_name:f'G{opt.mod_id_seg}{i}' for i,mod_name in enumerate(l_modname_seg)}
+            else:
+                d_modname2id_seg = {mod_name:f'G{opt.mod_id_seg}{i+1}' for i,mod_name in enumerate(l_modname_seg)}
+        
+        if not mod_only and opt.seg_gen:
+            d_modname2id['Seg'] = f'G{opt.mod_id_seg}'
+        
         if seg_only:
-            images = {'Seg': results['G5']}
-            if 'G4' in results:
-                images.update({'Marker': results['G4']})
+            images = {'Seg': results[d_modname2id['Seg']]}
+            marker_key = find_marker_key(d_modname2id)
+            if marker_key is not None:
+                images[marker_key] = results[d_modname2id[marker_key]]
+            # if f'G{opt.modalities_no}' in results:
+            #     images.update({'Marker': results['G{opt.modalities_no}']})
+            # if 'Marker' in d_modname2id:
+            #     images.update({'Marker': results[d_modname2id['Marker']]})
         else:
-            images = {
-                'Hema': results['G1'],
-                'DAPI': results['G2'],
-                'Lap2': results['G3'],
-                'Marker': results['G4'],
-                'Seg': results['G5'],
-            }
+            # images = {
+            #     'Hema': results['G1'],
+            #     'DAPI': results['G2'],
+            #     'Lap2': results['G3'],
+            #     'Marker': results['G4'],
+            #     'Seg': results['G5'],
+            # }
+            # images = {f'mod{i+1}': results[f'G{i+1}'] for i in range(opt.modalities_no)}
+            # images['Seg'] = results[f'G{opt.modalities_no+1}']
+            images = {mod_name: results[mod_id] for mod_name,mod_id in d_modname2id.items()}
         
-        if return_seg_intermediate and not seg_only:
-            images.update({'IHC_s':results['G51'],
-                          'Hema_s':results['G52'],
-                          'DAPI_s':results['G53'],
-                          'Lap2_s':results['G54'],
-                          'Marker_s':results['G55'],})
+        if opt.seg_gen and return_seg_intermediate and not seg_only:
+            # images.update({'IHC_s':results['G51'],
+            #               'Hema_s':results['G52'],
+            #               'DAPI_s':results['G53'],
+            #               'Lap2_s':results['G54'],
+            #               'Marker_s':results['G55'],})
+            
+            #images.update({f'mod{i+1}_s':results[f'G{opt.modalities_no+1}{i+1}'] for i in range(opt.modalities_no+1)})
+            #images.update({f'{mod_name}_s':results[f'G{opt.modalities_no+1}']})
+            images.update({f'{mod_name}_s':results[d_modname2id_seg[mod_name]] for mod_name in d_modname2id_seg.keys()})
         
-        if color_dapi and not seg_only:
-            matrix = (       0,        0,        0, 0,
-                      299/1000, 587/1000, 114/1000, 0,
-                      299/1000, 587/1000, 114/1000, 0)
-            images['DAPI'] = images['DAPI'].convert('RGB', matrix)
-        if color_marker and not seg_only:
-            matrix = (299/1000, 587/1000, 114/1000, 0,
-                      299/1000, 587/1000, 114/1000, 0,
-                             0,        0,        0, 0)
-            images['Marker'] = images['Marker'].convert('RGB', matrix)
+        # if color_dapi and not seg_only:
+        #     matrix = (       0,        0,        0, 0,
+        #               299/1000, 587/1000, 114/1000, 0,
+        #               299/1000, 587/1000, 114/1000, 0)
+        #     images['DAPI'] = images['DAPI'].convert('RGB', matrix)
+        # if color_marker and not seg_only:
+        #     matrix = (299/1000, 587/1000, 114/1000, 0,
+        #               299/1000, 587/1000, 114/1000, 0,
+        #                      0,        0,        0, 0)
+        #     images['Marker'] = images['Marker'].convert('RGB', matrix)
         return images
 
     elif opt.model == 'DeepLIIFExt':
@@ -445,11 +579,11 @@ def inference(img, tile_size, overlap_size, model_path, use_torchserve=False,
         return results # return result images with default key names (i.e., net names)
 
 
-def postprocess(orig, images, tile_size, model, seg_thresh=150, size_thresh='default', marker_thresh=None, size_thresh_upper=None, patch_classifier_mask=None, tissue_mask=None):
-    if model == 'DeepLIIF':
+def postprocess(orig, images, tile_size, model, seg_thresh=120, size_thresh='default', marker_thresh=None, size_thresh_upper=None, patch_classifier_mask=None, tissue_mask=None):
+    if model in ['DeepLIIF','DeepLIIFKD']:
         resolution = '40x' if tile_size > 384 else ('20x' if tile_size > 192 else '10x')
         overlay, refined, scoring = compute_final_results(
-            orig, images['Seg'], images.get('Marker'), resolution,
+            orig, images['Seg'], images.get(find_marker_key(images)), resolution,
             size_thresh, marker_thresh, size_thresh_upper, seg_thresh, patch_classifier_mask=patch_classifier_mask, tissue_mask=tissue_mask)
         processed_images = {}
         processed_images['SegOverlaid'] = Image.fromarray(overlay)
@@ -477,8 +611,9 @@ def postprocess(orig, images, tile_size, model, seg_thresh=150, size_thresh='def
 
 
 def infer_modalities(img, tile_size, model_dir, eager_mode=False,
-                     color_dapi=False, color_marker=False, opt=None, return_seg_intermediate=False, patch_classifier_mask=None, tissue_mask=None):
-
+                     color_dapi=False, color_marker=False, opt=None,
+                     return_seg_intermediate=False, seg_only=False, mod_only=False, seg_weights=None,
+                     patch_classifier_mask=None, tissue_mask=None):
     """
     This function is used to infer modalities for the given image using a trained model.
     :param img: The input image.
@@ -505,18 +640,28 @@ def infer_modalities(img, tile_size, model_dir, eager_mode=False,
         color_dapi=color_dapi,
         color_marker=color_marker,
         opt=opt,
-        return_seg_intermediate=return_seg_intermediate
+        return_seg_intermediate=return_seg_intermediate,
+        seg_only=seg_only,
+        mod_only=mod_only,
+        seg_weights=seg_weights,
     )
-    
+
     if not hasattr(opt,'seg_gen') or (hasattr(opt,'seg_gen') and opt.seg_gen): # the first condition accounts for old settings of deepliif; the second refers to deepliifext models
-        post_images, scoring = postprocess(img, images, tile_size, opt.model, patch_classifier_mask=patch_classifier_mask, tissue_mask=tissue_mask)
-        images = {**images, **post_images}
-        return images, scoring
+        if not mod_only:
+            post_images, scoring = postprocess(img, images, tile_size, opt.model, patch_classifier_mask=patch_classifier_mask, tissue_mask=tissue_mask)
+            images = {**images, **post_images}
+            if seg_only:
+                delete_keys = [k for k in images.keys() if 'Seg' not in k]
+                for name in delete_keys:
+                    del images[name]
+            return images, scoring
+        else:
+            return images, None
     else:
         return images, None
 
 
-def infer_results_for_wsi(input_dir, filename, output_dir, model_dir, tile_size, region_size=20000):
+def infer_results_for_wsi(input_dir, filename, output_dir, model_dir, tile_size, region_size=20000, color_dapi=False, color_marker=False, seg_intermediate=False, seg_only=False, seg_weights=None):
     """
     This function infers modalities and segmentation mask for the given WSI image. It
 
@@ -534,7 +679,7 @@ def infer_results_for_wsi(input_dir, filename, output_dir, model_dir, tile_size,
         os.makedirs(results_dir)
     size_x, size_y, size_z, size_c, size_t, pixel_type = get_information(os.path.join(input_dir, filename))
     rescale = (pixel_type != 'uint8')
-    print(filename, size_x, size_y, size_z, size_c, size_t, pixel_type)
+    print(filename, size_x, size_y, size_z, size_c, size_t, pixel_type, flush=True)
 
     results = {}
     scoring = None
@@ -545,12 +690,12 @@ def infer_results_for_wsi(input_dir, filename, output_dir, model_dir, tile_size,
 
         while start_x < size_x:
             while start_y < size_y:
-                print(start_x, start_y)
+                print(start_x, start_y, flush=True)
                 region_XYWH = (start_x, start_y, min(region_size, size_x - start_x), min(region_size, size_y - start_y))
                 region = reader.read(XYWH=region_XYWH, rescale=rescale)
                 img = Image.fromarray((region * 255).astype(np.uint8)) if rescale else Image.fromarray(region)
 
-                region_modalities, region_scoring = infer_modalities(img, tile_size, model_dir)
+                region_modalities, region_scoring = infer_modalities(img, tile_size, model_dir, color_dapi=color_dapi, color_marker=color_marker, return_seg_intermediate=seg_intermediate, seg_only=seg_only, seg_weights=seg_weights)
                 if region_scoring is not None:
                     if scoring is None:
                         scoring = {
@@ -582,13 +727,11 @@ def infer_results_for_wsi(input_dir, filename, output_dir, model_dir, tile_size,
         with open(os.path.join(results_dir, f'{basename}.json'), 'w') as f:
             json.dump(scoring, f, indent=2)
 
-    javabridge.kill_vm()
-
 
 def get_wsi_resolution(filename):
     """
-    Use OpenSlide to get the resolution (magnification) of the slide
-    and the corresponding tile size to use by default for DeepLIIF.
+    Try to get the resolution (magnification) of the slide and
+    the corresponding tile size to use by default for DeepLIIF.
     If it cannot be found, return (None, None) instead.
 
     Parameters
@@ -599,20 +742,48 @@ def get_wsi_resolution(filename):
     Returns
     -------
     str :
-        Magnification (objective power) as found by OpenSlide.
+        Magnification (objective power) from image metadata.
     int :
         Corresponding tile size for DeepLIIF.
     """
+
+    init_javabridge_bioformats()
+    metadata = bioformats.get_omexml_metadata(filename)
+
+    mag = None
     try:
-        image = openslide.OpenSlide(filename)
-        mag = image.properties.get(openslide.PROPERTY_NAME_OBJECTIVE_POWER)
+        omexml = bioformats.OMEXML(metadata)
+        mag = omexml.instrument().Objective.NominalMagnification
+    except Exception as e:
+        fields = ['AppMag', 'NominalMagnification']
+        try:
+            for field in fields:
+                idx = metadata.find(field)
+                if idx >= 0:
+                    for i in range(idx, len(metadata)):
+                        if metadata[i].isdigit() or metadata[i] == '.':
+                            break
+                    for j in range(i, len(metadata)):
+                        if not metadata[j].isdigit() and metadata[j] != '.':
+                            break
+                    if i == j:
+                        continue
+                    mag = metadata[i:j]
+                    break
+        except Exception as e:
+            pass
+
+    if mag is None:
+        return None, None
+
+    try:
         tile_size = round((float(mag) / 40) * 512)
         return mag, tile_size
     except Exception as e:
         return None, None
 
 
-def infer_cells_for_wsi(filename, model_dir, tile_size, region_size=20000, version=3, print_log=False):
+def infer_cells_for_wsi(filename, model_dir, tile_size, region_size=20000, version=3, print_log=False, seg_weights=None):
     """
     Perform inference on a slide and get the results individual cell data.
 
@@ -627,9 +798,12 @@ def infer_cells_for_wsi(filename, model_dir, tile_size, region_size=20000, versi
     region_size : int
         Maximum size to split the slide for processing.
     version : int
-        Version of cell data to return (3 or 4).
+        Version of cell data to return (3, 4, 5, or 6).
     print_log : bool
         Whether or not to print updates while processing.
+    seg_weights : list | tuple
+        Optional five weights to use for creating the combined Seg image.
+        If None, then the default weights are used.
 
     Returns
     -------
@@ -643,33 +817,39 @@ def infer_cells_for_wsi(filename, model_dir, tile_size, region_size=20000, versi
 
     resolution = '40x' if tile_size > 384 else ('20x' if tile_size > 192 else '10x')
 
-    size_x, size_y, size_z, size_c, size_t, pixel_type = get_information(filename)
-    rescale = (pixel_type != 'uint8')
-    print_info('Info:', size_x, size_y, size_z, size_c, size_t, pixel_type)
-
-    num_regions_x = math.ceil(size_x / region_size)
-    num_regions_y = math.ceil(size_y / region_size)
-    stride_x = math.ceil(size_x / num_regions_x)
-    stride_y = math.ceil(size_y / num_regions_y)
-    print_info('Strides:', stride_x, stride_y)
-
     data = None
     default_marker_thresh, count_marker_thresh = 0, 0
     default_size_thresh, count_size_thresh = 0, 0
 
-    # javabridge already set up from previous call to get_information()
-    with bioformats.ImageReader(filename) as reader:
+    with WSIReader(filename) as reader:
+        size_x = reader.width
+        size_y = reader.height
+        print_info('Info:', size_x, size_y)
+
+        num_regions_x = math.ceil(size_x / region_size)
+        num_regions_y = math.ceil(size_y / region_size)
+        num_regions = num_regions_x * num_regions_y
+        print_info('Num regions:', num_regions)
+
+        stride_x = math.ceil(size_x / num_regions_x)
+        stride_y = math.ceil(size_y / num_regions_y)
+        print_info('Strides:', stride_x, stride_y)
+
         start_x, start_y = 0, 0
 
+        count = 0
         while start_y < size_y:
             while start_x < size_x:
                 region_XYWH = (start_x, start_y, min(stride_x, size_x-start_x), min(stride_y, size_y-start_y))
                 print_info('Region:', region_XYWH)
+                count += 1
+                print_info('Region num:', count, '/', num_regions)
 
-                region = reader.read(XYWH=region_XYWH, rescale=rescale)
+                region = reader.read(region_XYWH)
                 print_info(region.shape, region.dtype)
-                img = Image.fromarray((region * 255).astype(np.uint8)) if rescale else Image.fromarray(region)
+                img = Image.fromarray(region)
                 print_info(img.size, img.mode)
+                del region
 
                 images = inference(
                     img,
@@ -682,27 +862,57 @@ def infer_cells_for_wsi(filename, model_dir, tile_size, region_size=20000, versi
                     opt=None,
                     return_seg_intermediate=False,
                     seg_only=True,
+                    seg_weights=seg_weights,
                 )
-                region_data = compute_cell_results(images['Seg'], images.get('Marker'), resolution, version=version)
+
+                seg = to_array(images['Seg'])
+                del images['Seg']
+
+                if version == 5 or version == 6:
+                    marker = to_array(img)
+                else:
+                    marker_key = find_marker_key(images)
+                    marker = to_array(images[marker_key], True) if marker_key is not None else None
+
+                del img
+                del images
+
+                region_data = compute_cell_results(seg, marker, resolution, version=version)
+                del seg
+                del marker
 
                 if start_x != 0 or start_y != 0:
                     for i in range(len(region_data['cells'])):
-                        cell = decode_cell_data_v4(region_data['cells'][i]) if version == 4 else region_data['cells'][i]
+                        if version == 4:
+                            cell = decode_cell_data_v4(region_data['cells'][i])
+                        elif version == 6:
+                            cell = decode_cell_data_v4(region_data['cells'][i], v6=True)
+                        else:
+                            cell = region_data['cells'][i]
+
                         for j in range(2):
                             cell['bbox'][j] = (cell['bbox'][j][0] + start_x, cell['bbox'][j][1] + start_y)
                         cell['centroid'] = (cell['centroid'][0] + start_x, cell['centroid'][1] + start_y)
                         for j in range(len(cell['boundary'])):
                             cell['boundary'][j] = (cell['boundary'][j][0] + start_x, cell['boundary'][j][1] + start_y)
-                        region_data['cells'][i] = encode_cell_data_v4(cell) if version == 4 else cell
+
+                        if version == 4:
+                            region_data['cells'][i] = encode_cell_data_v4(cell)
+                        elif version == 6:
+                            region_data['cells'][i] = encode_cell_data_v4(cell, v6=True)
+                        else:
+                            region_data['cells'][i] = cell
 
                 if data is None:
                     data = region_data
                 else:
                     data['cells'] += region_data['cells']
 
-                if region_data['settings']['default_marker_thresh'] is not None and region_data['settings']['default_marker_thresh'] != 0:
-                    default_marker_thresh += region_data['settings']['default_marker_thresh']
-                    count_marker_thresh += 1
+                if version == 3 or version == 4:
+                    if region_data['settings']['default_marker_thresh'] is not None and region_data['settings']['default_marker_thresh'] != 0:
+                        default_marker_thresh += region_data['settings']['default_marker_thresh']
+                        count_marker_thresh += 1
+
                 if region_data['settings']['default_size_thresh'] != 0:
                     default_size_thresh += region_data['settings']['default_size_thresh']
                     count_size_thresh += 1
@@ -712,13 +922,34 @@ def infer_cells_for_wsi(filename, model_dir, tile_size, region_size=20000, versi
             start_x = 0
             start_y += stride_y
 
-    javabridge.kill_vm()
+    if version == 3 or version == 4:
+        if count_marker_thresh == 0:
+            count_marker_thresh = 1
+        data['settings']['default_marker_thresh'] = round(default_marker_thresh / count_marker_thresh)
 
-    if count_marker_thresh == 0:
-        count_marker_thresh = 1
     if count_size_thresh == 0:
         count_size_thresh = 1
-    data['settings']['default_marker_thresh'] = round(default_marker_thresh / count_marker_thresh)
     data['settings']['default_size_thresh'] = round(default_size_thresh / count_size_thresh)
 
+    data['settings']['tile_size'] = tile_size
+    data['settings']['region_size'] = region_size
+    data['settings']['seg_weights'] = seg_weights
+
+    try:
+        data['deepliifVersion'] = importlib.metadata.version('deepliif')
+    except Exception as e:
+        data['deepliifVersion'] = 'unknown'
+
+    try:
+        data['modelVersion'] = pathlib.PurePath(model_dir).name
+    except Exception as e:
+        data['modelVersion'] = 'unknown'
+
     return data
+
+
+def find_marker_key(dictionary):
+    for key in dictionary:
+        if key.endswith('Marker'):
+            return key
+    return None

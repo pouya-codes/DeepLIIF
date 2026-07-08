@@ -80,7 +80,7 @@ def adjust_marker(inferred_tile, orig_tile):
 
 
 # Default postprocessing values
-DEFAULT_SEG_THRESH = 150
+DEFAULT_SEG_THRESH = 120
 DEFAULT_NOISE_THRESH = 4
 
 # Values for uint8 label masks
@@ -118,6 +118,24 @@ def to_array(img, grayscale=False):
     if grayscale and len(img.shape) == 3:
         img = img.max(axis=-1)
     return img
+
+
+@jit(nopython=True)
+def create_od_image(orig):
+    # create optical density (OD) LUT
+    lut = [0]
+    for i in range(1, 256):
+        lut.append(math.log10(255 / i))
+    lut[0] = lut[1]
+
+    # create OD values array
+    od = np.zeros(orig.shape[0:2], dtype=np.uint16)
+    for y in range(orig.shape[0]):
+        for x in range(orig.shape[1]):
+            val = lut[orig[y, x, 0]] + lut[orig[y, x, 1]] + lut[orig[y, x, 2]]
+            od[y, x] = round(val * 100)
+
+    return od
 
 
 @jit(nopython=True)
@@ -184,28 +202,34 @@ def mark_background(mask):
         After the function executes, the pixels will be labeled as background, positive, negative, or unknown.
     """
 
-    seeds = []
     for i in range(mask.shape[0]):
         if mask[i, 0] == LABEL_UNKNOWN:
-            seeds.append((i, 0))
+            mask[i, 0] = LABEL_BACKGROUND
         if mask[i, mask.shape[1]-1] == LABEL_UNKNOWN:
-            seeds.append((i, mask.shape[1]-1))
+            mask[i, mask.shape[1]-1] = LABEL_BACKGROUND
     for j in range(mask.shape[1]):
         if mask[0, j] == LABEL_UNKNOWN:
-            seeds.append((0, j))
+            mask[0, j] = LABEL_BACKGROUND
         if mask[mask.shape[0]-1, j] == LABEL_UNKNOWN:
-            seeds.append((mask.shape[0]-1, j))
+            mask[mask.shape[0]-1, j] = LABEL_BACKGROUND
 
-    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-
-    while len(seeds) > 0:
-        seed = seeds.pop()
-        if mask[seed] == LABEL_UNKNOWN:
-            mask[seed] = LABEL_BACKGROUND
-            for n in neighbors:
-                idx = (seed[0] + n[0], seed[1] + n[1])
-                if in_bounds(mask, idx) and mask[idx] == LABEL_UNKNOWN:
-                    seeds.append(idx)
+    count = 1
+    while count > 0:
+        count = 0
+        for i in range(mask.shape[0]):
+            for j in range(mask.shape[1]):
+                if mask[i, j] == LABEL_UNKNOWN:
+                    if (mask[i-1, j] == LABEL_BACKGROUND or mask[i+1, j] == LABEL_BACKGROUND or
+                            mask[i, j-1] == LABEL_BACKGROUND or mask[i, j+1] == LABEL_BACKGROUND):
+                        mask[i, j] = LABEL_BACKGROUND
+                        count += 1
+        if count > 0:
+            for i in range(mask.shape[0]-1, -1, -1):
+                for j in range(mask.shape[1]-1, -1, -1):
+                    if mask[i, j] == LABEL_UNKNOWN:
+                        if (mask[i-1, j] == LABEL_BACKGROUND or mask[i+1, j] == LABEL_BACKGROUND or
+                                mask[i, j-1] == LABEL_BACKGROUND or mask[i, j+1] == LABEL_BACKGROUND):
+                            mask[i, j] = LABEL_BACKGROUND
 
 @jit(nopython=True)
 def compute_cell_classification_modified(mask, marker, size_thresh, marker_thresh, size_thresh_upper = None, orig=None, patch_classifier_mask=None):
@@ -314,7 +338,7 @@ def compute_cell_classification_modified(mask, marker, size_thresh, marker_thres
 
 
 @jit(nopython=True)
-def compute_cell_mapping(mask, marker, noise_thresh, patch_classifier_mask=None):
+def compute_cell_mapping(mask, marker, noise_thresh, large_noise_thresh, use_avg=False):
     """
     Compute the mapping from mask to positive and negative cells.
 
@@ -325,6 +349,12 @@ def compute_cell_mapping(mask, marker, noise_thresh, patch_classifier_mask=None)
         After the function executes, the pixels will be labeled as background or cell.
     marker : ndarray
         2D uint8 array with the inferred marker values.
+    noise_thresh : int
+        Segmented cell must be larger than this value to be included.
+    large_noise_thresh : int | None
+        If specified, segmented cell must be less than this value to be included.
+    use_avg : bool
+        Use average instad of max value for marker value.
 
     Returns
     -------
@@ -347,7 +377,7 @@ def compute_cell_mapping(mask, marker, noise_thresh, patch_classifier_mask=None)
                 count = 1
                 count_positive = 1 if mask[y, x] == LABEL_POSITIVE else 0
                 count_negative = 1 if mask[y, x] == LABEL_NEGATIVE else 0
-                max_marker = marker[y, x] if marker is not None else 0
+                marker_val = marker[y, x] if marker is not None else 0
                 mask[y, x] = LABEL_CELL
                 center_y = y
                 center_x = x
@@ -362,23 +392,28 @@ def compute_cell_mapping(mask, marker, noise_thresh, patch_classifier_mask=None)
                                 count_positive += 1
                             elif mask[idx] == LABEL_NEGATIVE:
                                 count_negative += 1
-                            if marker is not None and marker[idx] > max_marker:
-                                max_marker = marker[idx]
+                            if marker is not None:
+                                if use_avg:
+                                    marker_val += marker[idx]
+                                elif marker[idx] > marker_val:
+                                    marker_val = marker[idx]
                             mask[idx] = LABEL_CELL
                             center_y += idx[0]
                             center_x += idx[1]
                             count += 1
 
-                if count > noise_thresh:
+                if count > noise_thresh and (large_noise_thresh is None or count < large_noise_thresh):
                     center_y = int(round(center_y / count))
                     center_x = int(round(center_x / count))
                     positive = True if count_positive >= count_negative else False
-                    cells.append((count, positive, max_marker, x, y, center_x, center_y))
+                    if use_avg:
+                        marker_val = round(marker_val / count)
+                    cells.append((count, positive, marker_val, x, y, center_x, center_y))
 
     return cells
 
-# todo : add patch_classifier_mask to the function signature and pass it to compute_cell_mapping
-def get_cells_info(seg, marker, resolution, noise_thresh, seg_thresh, patch_classifier_mask=None):
+
+def get_cells_info(seg, marker, resolution, noise_thresh, seg_thresh, large_noise_thresh, use_od=False):
     """
     Find all cells in the segmentation image that are larger than the noise threshold.
 
@@ -388,12 +423,17 @@ def get_cells_info(seg, marker, resolution, noise_thresh, seg_thresh, patch_clas
         Inferred segmentation map image.
     marker : Image | ndarray
         Inferred marker image.
+        If 'use_od' is True, then this must be the original IHC image to use for optical density calculation instead.
     resolution: string
         The resolution/magnification of the original image.  Valid values are '10x', '20x', or '40x'.
     noise_thresh : int
         Threshold for tiny noise to ignore (include only cells larger than this value).
     seg_thresh : int
         Threshold to use in determining if a pixel should be labeled as positive/negative.
+    large_noise_thresh : int | None
+        Threshold for large noise to ignore (include only cells smaller than this value).
+    use_od : bool
+        Whether to use optical density calculation instead of marker value.
 
     Returns
     -------
@@ -406,18 +446,22 @@ def get_cells_info(seg, marker, resolution, noise_thresh, seg_thresh, patch_clas
     """
 
     seg = to_array(seg)
-    if marker is not None:
+    if marker is not None and use_od:
+        marker = to_array(marker)
+        marker = create_od_image(marker)
+    elif marker is not None:
         marker = to_array(marker, True)
+
     mask = create_posneg_mask(seg, seg_thresh)
     mark_background(mask)
-    cellsinfo = compute_cell_mapping(mask, marker, noise_thresh, patch_classifier_mask=None)
+    cellsinfo = compute_cell_mapping(mask, marker, noise_thresh, large_noise_thresh, use_od)
 
     defaults = {}
     sizes = np.zeros(len(cellsinfo), dtype=np.int64)
     for i in range(len(cellsinfo)):
         sizes[i] = cellsinfo[i][0]
     defaults['size_thresh'] = calculate_default_size_threshold(sizes, resolution)
-    if marker is not None:
+    if marker is not None and not use_od:
         defaults['marker_thresh'] = calculate_default_marker_threshold(marker)
 
     return mask, cellsinfo, defaults
@@ -810,7 +854,7 @@ def from_base92(val):
     return res
 
 
-def encode_cell_data_v4(data):
+def encode_cell_data_v4(data, v6=False):
     """
     Encode as v4 the provided cell data to string.
 
@@ -834,7 +878,7 @@ def encode_cell_data_v4(data):
 
     # encode cell classification (pos/neg) and marker value
     positive = int(data['positive'])
-    marker = data['marker']
+    marker = data['od'] if v6 else data['marker']
     classification = (marker * 2) + positive
     cell += to_base92(classification, 2)
 
@@ -909,7 +953,7 @@ def encode_cell_data_v4(data):
     return cell
 
 
-def decode_cell_data_v4(cell):
+def decode_cell_data_v4(cell, v6=False):
     """
     Decode v4 encoded cell string and return dictionary of cell data.
 
@@ -938,7 +982,11 @@ def decode_cell_data_v4(cell):
     # decode cell classification (pos/neg) and marker value
     classification = from_base92(cell[1+ns:3+ns])
     data['positive'] = bool(classification % 2)
-    data['marker'] = classification // 2
+    marker = classification // 2
+    if v6:
+        data['od'] = marker
+    else:
+        data['marker'] = marker
 
     # decode anchor point (bbox top left) and extent (bbox bottom right)
     x = from_base92(cell[3+ns:3+ns+na])
@@ -981,7 +1029,9 @@ def decode_cell_data_v4(cell):
 def create_cell_classification(mask, cellsinfo,
                                size_thresh=0,
                                marker_thresh=None,
-                               size_thresh_upper=None):
+                               size_thresh_upper=None,
+                               od_thresh_lower=None,
+                               od_thresh_upper=None):
     """
     Create final cell classification in-place for the mask and
     calculate counts for positive and negative cell counts.
@@ -1008,12 +1058,19 @@ def create_cell_classification(mask, cellsinfo,
     neighbors = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]
     border_neighbors = [(0, -1), (-1, 0), (1, 0), (0, 1)]
     num_pos, num_neg = 0, 0
-    if marker_thresh is None:
-        marker_thresh = 255
 
     for cell in cellsinfo:
         if cell[0] > size_thresh and (size_thresh_upper is None or cell[0] < size_thresh_upper):
-            is_pos = True if cell[1] or cell[2] > marker_thresh else False
+            is_pos = cell[1]
+
+            if marker_thresh is not None and cell[2] > marker_thresh:
+                is_pos = True
+
+            if od_thresh_lower is not None and cell[2] < od_thresh_lower:
+                is_pos = False
+            elif od_thresh_upper is not None and cell[2] > od_thresh_upper:
+                is_pos = False
+
             if is_pos:
                 label = LABEL_POSITIVE
                 label_border = LABEL_BORDER_POS
@@ -1034,16 +1091,11 @@ def create_cell_classification(mask, cellsinfo,
                     idx = (seed[0] + n[0], seed[1] + n[1])
                     if in_bounds(mask, idx) and mask[idx] == LABEL_CELL:
                         seeds.append(idx)
-                        is_boundary = False
                         for n in border_neighbors:
                             idx2 = (idx[0] + n[0], idx[1] + n[1])
                             if in_bounds(mask, idx2) and mask[idx2] == LABEL_BACKGROUND:
-                                is_boundary = True
-                                break
-                        if is_boundary:
-                            mask[idx] = label_border
-                        else:
-                            mask[idx] = label
+                                mask[idx2] = label_border
+                        mask[idx] = label
 
     num_total = num_pos + num_neg
     return {
@@ -1072,7 +1124,7 @@ def enlarge_cell_boundaries(mask):
                 value = LABEL_BORDER_POS2 if mask[y, x] == LABEL_BORDER_POS else LABEL_BORDER_NEG2
                 for n in neighbors:
                     idx = (y + n[0], x + n[1])
-                    if in_bounds(mask, idx) and mask[idx] != LABEL_BORDER_POS and mask[idx] != LABEL_BORDER_NEG:
+                    if in_bounds(mask, idx) and mask[idx] == LABEL_BACKGROUND:
                         mask[idx] = value
 
     for y in range(mask.shape[0]):
@@ -1148,10 +1200,52 @@ def fill_cells(mask):
                 else:
                     mask[y, x] = LABEL_NEGATIVE
 
+    for y in range(mask.shape[0]):
+        for x in range(mask.shape[1]):
+            if mask[y, x] == LABEL_BORDER_POS:
+                mask[y, x] = LABEL_POSITIVE
+            elif mask[y, x] == LABEL_BORDER_NEG:
+                mask[y, x] = LABEL_NEGATIVE
+
+
+@jit(nopython=True)
+def create_outer_boundary(mask):
+    """
+    For a mask with positive and negative cell labels,
+    set pixels neighboring the cells in-place to border labels.
+
+    Parameters
+    ----------
+    mask : ndarray
+        2D uint8 label map.
+    """
+
+    border_neighbors = [(0, -1), (-1, 0), (1, 0), (0, 1)]
+
+    for y in range(mask.shape[0]):
+        for x in range(mask.shape[1]):
+            if mask[y, x] == LABEL_POSITIVE or mask[y, x] == LABEL_NEGATIVE:
+                for n in border_neighbors:
+                    idx2 = (y + n[0], x + n[1])
+                    if in_bounds(mask, idx2) and mask[idx2] == LABEL_BACKGROUND:
+                        mask[idx2] = LABEL_BORDER_POS if mask[y, x] == LABEL_POSITIVE else LABEL_BORDER_NEG
+
+
+def calculate_large_noise_thresh(large_noise_thresh, resolution):
+    if large_noise_thresh != 'default':
+        return large_noise_thresh
+    if resolution == '10x':
+        return 1000
+    elif resolution == '20x':
+        return 4000
+    else: # 40x
+        return 16000
+
 
 def compute_cell_results(seg, marker, resolution, version=3,
                          seg_thresh=DEFAULT_SEG_THRESH,
-                         noise_thresh=DEFAULT_NOISE_THRESH):
+                         noise_thresh=DEFAULT_NOISE_THRESH,
+                         large_noise_thresh=None):
     """
     Perform postprocessing to compute individual cell results.
 
@@ -1160,15 +1254,21 @@ def compute_cell_results(seg, marker, resolution, version=3,
     seg : Image | ndarray
         Inferred segmentation map image.
     marker : Image | ndarray
-        Inferred marker image.
+        Inferred marker image for versions 3 or 4.
+        Original IHC image for versions 5 or 6 (used for optical density calculation).
     resolution : string
         The resolution/magnification of the original image.  Valid values are '10x', '20x', or '40x'.
     version : int
-        Version of the cell data (valid values are 3 and 4).
+        Version of the cell data (valid values: 3, 4, 5, 6).
+        A value of 3 or 4 will use marker value (if marker image is present).
+        A value of 5 or 6 will use optical density (if original IHC is present).
     seg_thresh : int
         Threshold to use in determining if a pixel should be labeled as positive/negative.
     noise_thresh : int
         Threshold for tiny noise to ignore (include only cells larger than this value).
+    large_noise_thresh : int | string | None
+        Threshold for large noise to ignore (include only cells smaller than this value).
+        Valid arguments can be an integer value, the string value 'default', or None.
 
     Returns
     -------
@@ -1176,35 +1276,53 @@ def compute_cell_results(seg, marker, resolution, version=3,
         Individual cell data and other associated values.
     """
 
-    if version not in [3, 4]:
+    if version not in [3, 4, 5, 6]:
         warnings.warn('Invalid cell data version provided, defaulting to version 3.')
         version = 3
 
-    mask, cellsinfo, defaults = get_cells_info(seg, marker, resolution, noise_thresh, seg_thresh)
+    large_noise_thresh = calculate_large_noise_thresh(large_noise_thresh, resolution)
+    use_od = True if version == 5 or version == 6 else False
+    mask, cellsinfo, defaults = get_cells_info(seg, marker, resolution, noise_thresh, seg_thresh, large_noise_thresh, use_od)
 
     cells = []
     for cell in cellsinfo:
         bbox, boundary = get_cell_boundary(mask, cell[3], cell[4])
-        data = {
-            'size': cell[0],
-            'positive': cell[1],
-            'marker': cell[2],
-            'bbox': bbox,
-            'centroid': (cell[5], cell[6]),
-            'boundary': make_simple_contour(boundary),
-        }
-        if version == 4:
-            data = encode_cell_data_v4(data)
+        if version == 3 or version == 4:
+            data = {
+                'size': cell[0],
+                'positive': cell[1],
+                'marker': cell[2],
+                'bbox': bbox,
+                'centroid': (cell[5], cell[6]),
+                'boundary': make_simple_contour(boundary),
+            }
+            if version == 4:
+                data = encode_cell_data_v4(data)
+        elif version == 5 or version == 6:
+            data = {
+                'size': cell[0],
+                'positive': cell[1],
+                'od': cell[2],
+                'bbox': bbox,
+                'centroid': (cell[5], cell[6]),
+                'boundary': make_simple_contour(boundary),
+            }
+            if version == 6:
+                data = encode_cell_data_v4(data, v6=True)
         cells.append(data)
+
+    settings = {
+        'default_size_thresh': defaults['size_thresh'],
+        'noise_thresh': noise_thresh,
+        'large_noise_thresh': large_noise_thresh,
+        'seg_thresh': seg_thresh,
+    }
+    if version == 3 or version == 4:
+        settings['default_marker_thresh'] = defaults['marker_thresh'] if 'marker_thresh' in defaults else None
 
     results = {
         'cells': cells,
-        'settings': {
-            'default_marker_thresh': defaults['marker_thresh'] if 'marker_thresh' in defaults else None,
-            'default_size_thresh': defaults['size_thresh'],
-            'noise_thresh': noise_thresh,
-            'seg_thresh': seg_thresh,
-        },
+        'settings': settings,
         'dataVersion': version,
     }
 
@@ -1217,6 +1335,9 @@ def compute_final_results(orig, seg, marker, resolution,
                           size_thresh_upper=None,
                           seg_thresh=DEFAULT_SEG_THRESH,
                           noise_thresh=DEFAULT_NOISE_THRESH,
+                          large_noise_thresh=None,
+                          od_thresh_lower=None,
+                          od_thresh_upper=None,
                           patch_classifier_mask=None,
                           tissue_mask=None,
                           ):
@@ -1243,6 +1364,15 @@ def compute_final_results(orig, seg, marker, resolution,
         Threshold to use in determining if a pixel should be labeled as positive/negative.
     noise_thresh : int
         Threshold for tiny noise to ignore (include only cells larger than this value).
+    large_noise_thresh : int | string | None
+        Threshold for large noise to ignore (include only cells smaller than this value).
+        Valid arguments can be an integer value, the string value 'default', or None.
+    od_thresh_lower : int | None
+        Lower threshold for optical density (must be greater than or equal to be classified as positive).
+        If specified, marker values are not used.
+    od_thresh_upper : int | None
+        Upper threshold for optical density (must be less than or equal to be classified as positive).
+        If specified, marker values are not used.
 
     Returns
     -------
@@ -1254,7 +1384,11 @@ def compute_final_results(orig, seg, marker, resolution,
         Dictionary with scoring and settings information.
     """
 
-    mask, cellsinfo, defaults = get_cells_info(seg, marker, resolution, noise_thresh, seg_thresh, patch_classifier_mask=None)
+    large_noise_thresh = calculate_large_noise_thresh(large_noise_thresh, resolution)
+    if od_thresh_lower is not None or od_thresh_upper is not None:
+        mask, cellsinfo, defaults = get_cells_info(seg, orig, resolution, noise_thresh, seg_thresh, large_noise_thresh, use_od=True)
+    else:
+        mask, cellsinfo, defaults = get_cells_info(seg, marker, resolution, noise_thresh, seg_thresh, large_noise_thresh, use_od=False)
 
     if tissue_mask is not None:
         mask = mask * (tissue_mask > 0).astype(np.uint8)
@@ -1265,7 +1399,8 @@ def compute_final_results(orig, seg, marker, resolution,
     if marker_thresh == 'default':
         marker_thresh = defaults['marker_thresh']
 
-    counts = create_cell_classification(mask, cellsinfo, size_thresh, marker_thresh, size_thresh_upper)
+    counts = create_cell_classification(mask, cellsinfo, size_thresh, marker_thresh, size_thresh_upper, od_thresh_lower, od_thresh_upper)
+    enlarge_cell_boundaries(mask)
     enlarge_cell_boundaries(mask)
     overlay, refined = create_final_images(np.array(orig), mask)
 
@@ -1287,7 +1422,9 @@ def compute_final_results(orig, seg, marker, resolution,
 def cells_to_final_results(data, orig,
                            size_thresh='default',
                            marker_thresh=None,
-                           size_thresh_upper=None):
+                           size_thresh_upper=None,
+                           od_thresh_lower=None,
+                           od_thresh_upper=None):
     """
     Compute final count and image results from previously postprocessed cell results.
 
@@ -1301,8 +1438,15 @@ def cells_to_final_results(data, orig,
         Include only cells larger than this size.
     marker_thresh : int
         Make cell positive if marker value is above this threshold (override original classification).
+        If specified, postprocessed cell results must have been generated with marker value.
     size_thresh_upper : int
         Include only cells smaller than this size.
+    od_thresh_lower : int | None
+        Lower threshold for optical density (must be greater than or equal to be classified as positive).
+        If specified, postprocessed cell results must have been generated with optical density.
+    od_thresh_upper : int | None
+        Upper threshold for optical density (must be less than or equal to be classified as positive).
+        If specified, postprocessed cell results must have been generated with optical density.
 
     Returns
     -------
@@ -1313,6 +1457,12 @@ def cells_to_final_results(data, orig,
     dict :
         Dictionary with scoring and settings information.
     """
+
+    if data['dataVersion'] == 3 or data['dataVersion'] == 4:
+        od_thresh_lower = None
+        od_thresh_upper = None
+    elif data['dataVersion'] == 5 or data['dataVersion'] == 6:
+        marker_thresh = None
 
     orig = np.array(orig)
     mask = np.full(orig.shape[0:2], LABEL_UNKNOWN, dtype=np.uint8)
@@ -1328,10 +1478,23 @@ def cells_to_final_results(data, orig,
     for cell in data['cells']:
         if data['dataVersion'] == 4:
             c = decode_cell_data_v4(cell)
+        elif data['dataVersion'] == 6:
+            c = decode_cell_data_v4(cell, v6=True)
         else:
             c = cell
+
         if c['size'] > size_thresh and (size_thresh_upper is None or c['size'] < size_thresh_upper):
-            if c['positive'] or (marker_thresh is not None and c['marker'] > marker_thresh):
+            is_pos = c['positive']
+
+            if marker_thresh is not None and c['marker'] > marker_thresh:
+                is_pos = True
+
+            if od_thresh_lower is not None and c['od'] < od_thresh_lower:
+                is_pos = False
+            elif od_thresh_upper is not None and c['od'] > od_thresh_upper:
+                is_pos = False
+
+            if is_pos:
                 num_pos += 1
                 label = LABEL_BORDER_POS
             else:
@@ -1344,6 +1507,8 @@ def cells_to_final_results(data, orig,
     mark_background(mask)
     fill_cells(mask)
 
+    create_outer_boundary(mask)
+    enlarge_cell_boundaries(mask)
     enlarge_cell_boundaries(mask)
     overlay, refined = create_final_images(np.array(orig), mask)
 

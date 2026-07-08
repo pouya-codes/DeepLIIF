@@ -2,6 +2,10 @@
 import os
 import collections
 
+import atexit
+import functools
+import threading
+
 import torch
 import numpy as np
 from PIL import Image, ImageOps
@@ -21,6 +25,9 @@ import bioformats
 import javabridge
 import bioformats.omexml as ome
 import tifffile as tf
+
+from tifffile import TiffFile
+import zarr
 
 
 excluding_names = ['Hema', 'DAPI', 'DAPILap2', 'Ki67', 'Seg', 'Marked', 'SegRefined', 'SegOverlaid', 'Marker', 'Lap2']
@@ -370,6 +377,104 @@ def adjust_background_tile(img):
     return image
 
 
+def infer_background_colors(dir_data, sample_size=5, input_no=1, modalities_no=4,
+                                    seg_no=1, tile_size=32, return_list=False):
+    fns = [x for x in os.listdir(dir_data) if x.endswith('.png')]
+    sample_size = min(sample_size, len(fns))
+    w, h, num_img = None, None, None
+
+    background_colors = {}
+
+    count = 0
+    while count < sample_size and len(fns) > 0: 
+        fn = fns.pop(0)
+        img = Image.open(f"{dir_data}/{fn}")
+        
+        if w is None:
+            num_img = img.size[0] / img.size[1]
+            num_img = int(num_img)
+            w, h = img.size
+        
+        background_colors_img = infer_background_colors_for_img(img, input_no=input_no, modalities_no=modalities_no, seg_no=seg_no, tile_size=tile_size, w=w, h=h, num_img=num_img)
+        
+        if background_colors_img is not None:
+            count += 1
+            for mod_id, rgb_avg in background_colors_img.items():
+                try:
+                    background_colors[mod_id].append(rgb_avg)
+                except:
+                    background_colors[mod_id] = [rgb_avg]
+    
+    if count > 0:
+        print(f'Calculating average color for empty tiles from {count} images..')
+        background_colors = {k:np.mean(v,axis=0).astype(np.uint8) for k,v in background_colors.items()}
+        
+        if return_list:
+            return [tuple(e) for e in background_colors.values()]
+        else:
+            return background_colors
+    else:
+        print('None of the images have empty tiles for estimating averge background color. Try with a proper tile size.')
+        return None
+
+
+def infer_background_colors_for_img(img, input_no=1, modalities_no=4, seg_no=1, tile_size=32,
+                                    w=None, h=None, num_img=None):
+    """
+    Estimate background colors for a given RGB image.
+    The empty tiles are determined by applying is_empty() function on segmentation modalities.
+    If multiple segmentation modalities present, only common empty tiles are used for background
+    color calculation.
+    """
+    from ..models import is_empty
+    
+    if w is None:
+        num_img = img.size[0] / img.size[1]
+        num_img = int(num_img)
+        w, h = img.size
+            
+    empty_tiles = {}
+    l_box = []
+    background_colors = {}
+    
+    for i in range(num_img-seg_no, num_img):
+        img_mod = img.crop((h*i,0,h*(i+1),h))
+        l_box_mod = []
+        for x in range(0, h, tile_size):
+            for y in range(0, h, tile_size):
+                box = (x, y, x+tile_size, y+tile_size)
+                tile = img_mod.crop(box)
+                if is_empty(tile):
+                    l_box_mod.append(box)
+        l_box.append(l_box_mod)
+
+    l_box_final = set()
+    if len(l_box) > 1:
+        # only keep overlapped boxes
+        for l in l_box:
+            l_box_final = l_box_final & set(l)
+        l_box_final = list(l_box_final)
+    else:
+        l_box_final = l_box[0]
+    #print(f'{len(l_box_final)} tiles are considered empty using segmentation modalities')
+    
+    if len(l_box_final) == 0: # this can happen for images with dense cells
+        return None
+
+    for i in range(input_no, modalities_no+input_no):
+        empty_tiles[i] = []
+        img_mod = img.crop((h*i,0,h*(i+1),h))
+        for box in l_box_final:
+            tile = img_mod.crop(box)
+            empty_tiles[i].append(tile)
+
+        img_avg = np.mean(np.stack(empty_tiles[i], axis=0), axis=0) # take an average across all empty images
+        rgb_avg = np.mean(img_avg,axis=(0,1)).astype(np.uint8)
+        background_colors[i] = rgb_avg
+
+    return background_colors
+
+
 def image_variance_gray(img):
     px = np.asarray(img) if img.mode == 'L' else np.asarray(img.convert('L'))
     idx = np.logical_and(px != 255, px != 0)
@@ -392,6 +497,30 @@ def image_variance_rgb(img):
     return var
 
 
+def init_javabridge_bioformats():
+    """
+    Initialize javabridge for use with bioformats.
+    Run as daemon so no need to explicitly call kill_vm.
+    This function will only run once; repeat calls do nothing.
+    """
+
+    if not hasattr(init_javabridge_bioformats, 'called'):
+        # https://github.com/LeeKamentsky/python-javabridge/issues/155
+        old_init = threading.Thread.__init__
+        threading.Thread.__init__ = functools.partialmethod(old_init, daemon=True)
+        javabridge.start_vm(class_path=bioformats.JARS)
+        threading.Thread.__init__ = old_init
+        atexit.register(javabridge.kill_vm)
+
+        rootLoggerName = javabridge.get_static_field("org/slf4j/Logger", "ROOT_LOGGER_NAME", "Ljava/lang/String;")
+        rootLogger = javabridge.static_call("org/slf4j/LoggerFactory", "getLogger",
+                                            "(Ljava/lang/String;)Lorg/slf4j/Logger;", rootLoggerName)
+        logLevel = javabridge.get_static_field("ch/qos/logback/classic/Level", "WARN", "Lch/qos/logback/classic/Level;")
+        javabridge.call(rootLogger, "setLevel", "(Lch/qos/logback/classic/Level;)V", logLevel)
+
+        init_javabridge_bioformats.called = True
+
+
 def read_bioformats_image_with_reader(path, channel=0, region=(0, 0, 0, 0)):
     """
     Using this function, you can read a specific region of a large image by giving the region bounding box (XYWH format)
@@ -402,14 +531,7 @@ def read_bioformats_image_with_reader(path, channel=0, region=(0, 0, 0, 0)):
     :param region: The bounding box around the region of interest (XYWH format).
     :return: The specified region of interest image (numpy array).
     """
-    javabridge.start_vm(class_path=bioformats.JARS)
-
-    rootLoggerName = javabridge.get_static_field("org/slf4j/Logger", "ROOT_LOGGER_NAME", "Ljava/lang/String;")
-    rootLogger = javabridge.static_call("org/slf4j/LoggerFactory", "getLogger",
-                                        "(Ljava/lang/String;)Lorg/slf4j/Logger;", rootLoggerName)
-    logLevel = javabridge.get_static_field("ch/qos/logback/classic/Level", "WARN", "Lch/qos/logback/classic/Level;")
-    javabridge.call(rootLogger, "setLevel", "(Lch/qos/logback/classic/Level;)V", logLevel)
-
+    init_javabridge_bioformats()
     with bioformats.ImageReader(path) as reader:
         return reader.read(t=channel, XYWH=region)
 
@@ -421,14 +543,7 @@ def get_information(filename):
     :param filename: The address to the ome image.
     :return: size_x, size_y, size_z, size_c, size_t, pixel_type
     """
-    javabridge.start_vm(class_path=bioformats.JARS)
-
-    rootLoggerName = javabridge.get_static_field("org/slf4j/Logger", "ROOT_LOGGER_NAME", "Ljava/lang/String;")
-    rootLogger = javabridge.static_call("org/slf4j/LoggerFactory", "getLogger",
-                                        "(Ljava/lang/String;)Lorg/slf4j/Logger;", rootLoggerName)
-    logLevel = javabridge.get_static_field("ch/qos/logback/classic/Level", "WARN", "Lch/qos/logback/classic/Level;")
-    javabridge.call(rootLogger, "setLevel", "(Lch/qos/logback/classic/Level;)V", logLevel)
-
+    init_javabridge_bioformats()
     metadata = bioformats.get_omexml_metadata(filename)
     omexml = bioformats.OMEXML(metadata)
     size_x, size_y, size_z, size_c, size_t, pixel_type = omexml.image().Pixels.SizeX, \
@@ -437,9 +552,143 @@ def get_information(filename):
                                                          omexml.image().Pixels.SizeC, \
                                                          omexml.image().Pixels.SizeT, \
                                                          omexml.image().Pixels.PixelType
-    print('SizeX:', size_x, ' SizeY:', size_y, ' SizeZ:', size_z, ' SizeC:', size_c, ' SizeT:', size_t, ' PixelType:', pixel_type)
+    #print('SizeX:', size_x, ' SizeY:', size_y, ' SizeZ:', size_z, ' SizeC:', size_c, ' SizeT:', size_t, ' PixelType:', pixel_type)
     return size_x, size_y, size_z, size_c, size_t, pixel_type
 
+
+class WSIReader:
+    """
+    Assumes the file is a single RGB image (e.g., not a stacked OME TIFF).
+    This reader will always return the data with pixel type of uint8.
+    """
+
+    def __init__(self, path):
+        init_javabridge_bioformats()
+        metadata = bioformats.get_omexml_metadata(path)
+        omexml = bioformats.OMEXML(metadata)
+
+        self._path = path
+        self._metadata = metadata
+        self._width = omexml.image().Pixels.SizeX
+        self._height = omexml.image().Pixels.SizeY
+        self._pixel_type = omexml.image().Pixels.PixelType
+
+        self._tif = None
+        if self._pixel_type == 'uint8':
+            try:
+                self._file = None
+                self._file = open(path, 'rb')
+                self._tif = TiffFile(self._file)
+                self._zarr = zarr.open(self._tif.pages[0].aszarr(), mode='r')
+            except Exception as e:
+                if self._tif is not None:
+                    self._tif.close()
+                    self._tif = None
+                if self._file is not None:
+                    self._file.close()
+
+        self._bfreader = None
+        self._rescale = (self._pixel_type != 'uint8')
+        self._bfreader = bioformats.ImageReader(path)
+
+        if self._tif is None and self._bfreader is None:
+            raise Exception('Cannot read WSI file.')
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def close(self):
+        if self._tif is not None:
+            self._tif.close()
+            self._file.close()
+        if self._bfreader is not None:
+            self._bfreader.close()
+
+    @property
+    def width(self):
+        return self._width
+
+    @property
+    def height(self):
+        return self._height
+
+    def read(self, xywh, zeros_on_error=False):
+        x, y, w, h = xywh
+
+        if self._tif is not None:
+            try:
+                return self._zarr[y:y+h, x:x+w]
+            except Exception as e:
+                pass
+
+        try:
+            px = self._bfreader.read(XYWH=xywh, rescale=self._rescale)
+            if self._rescale:
+                px = (px * 255).astype(np.uint8)
+            return px
+        except Exception as e:
+            if not zeros_on_error:
+                return self._read_region_by_tiles(xywh)
+
+        return np.zeros((h, w, 3), dtype=np.uint8)
+
+    def _read_region_by_tiles(self, xywh):
+        tile_width, tile_height = None, None
+
+        try:
+            if self._tif is not None and self._tif.pages[0].is_tiled:
+                tile_width = self._tif.pages[0].tilewidth
+                tile_height = self._tif.pages[0].tilelength
+            else:
+                root = et.fromstring(self._metadata.encode('utf-8'))
+                for origmeta in root.findall('.//{http://www.openmicroscopy.org/Schemas/OME/2016-06}OriginalMetadata'):
+                    key, value = None, None
+                    for om in origmeta:
+                        if 'Key' in om.tag:
+                            key = om.text
+                        elif 'Value' in om.tag:
+                            value = om.text
+                    if key == 'TileWidth' and value is not None:
+                        tile_width = int(value)
+                    elif key == 'TileLength' and value is not None:
+                        tile_height = int(value)
+        except Exception as e:
+            pass
+
+        if tile_width is None or tile_height is None:
+            tile_width, tile_height = 512, 512
+
+        x0, y0, w, h = xywh
+        w0 = x0 % tile_width
+        h0 = y0 % tile_height
+        x1 = x0 + w0
+        y1 = y0 + h0
+
+        px = np.zeros((h, w, 3), dtype=np.uint8)
+        tile = self.read((x0, y0, w0, h0), True)
+        px[0:h0, 0:w0] = tile
+
+        for x in range(x1, x0+w, tile_width):
+            tw = min(tile_width, x0+w-x)
+            tile = self.read((x, y0, tw, h0), True)
+            px[0:h0, x-x0:x-x0+tw] = tile
+
+        for y in range(y1, y0+h, tile_height):
+            th = min(tile_height, y0+h-y)
+            tile = self.read((x0, y, w0, th), True)
+            px[y-y0:y-y0+th, 0:w0] = tile
+
+        for y in range(y1, y0+h, tile_height):
+            for x in range(x1, x0+w, tile_width):
+                tw = min(tile_width, x0+w-x)
+                th = min(tile_height, y0+h-y)
+                tile = self.read((x, y, tw, th), True)
+                px[y-y0:y-y0+th, x-x0:x-x0+tw] = tile
+
+        return px
 
 
 

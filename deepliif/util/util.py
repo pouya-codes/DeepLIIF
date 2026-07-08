@@ -163,3 +163,130 @@ def check_multi_scale(img1, img2):
             if max_ssim[1] < image_ssim:
                 max_ssim = (tile_size, image_ssim)
     return max_ssim[0]
+
+
+import subprocess
+import os
+from threading import Thread , Timer
+import sched, time
+
+# modified from https://stackoverflow.com/questions/67707828/how-to-get-every-seconds-gpu-usage-in-python
+def get_gpu_memory(gpu_id=0):
+    """
+    Currently collects gpu memory info for a given gpu id.
+    """
+    output_to_list = lambda x: x.decode('ascii').split('\n')[:-1]
+    ACCEPTABLE_AVAILABLE_MEMORY = 1024
+    COMMAND = "nvidia-smi --query-gpu=memory.used --format=csv"
+    try:
+        memory_use_info = output_to_list(subprocess.check_output(COMMAND.split(),stderr=subprocess.STDOUT))[1:]
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError("command '{}' return with error (code {}): {}".format(e.cmd, e.returncode, e.output))
+    memory_use_values = [int(x.split()[0]) for i, x in enumerate(memory_use_info)]
+    
+    #assert len(memory_use_values)==1, f"get_gpu_memory::memory_use_values should have only 1 value, now has {len(memory_use_values)} (memory_use_values)"
+    return memory_use_values[gpu_id]
+
+class HardwareStatus():
+    def __init__(self):
+        self.gpu_mem = []
+        self.timer = None
+    
+    def get_status_every_sec(self, gpu_id=0):
+        """
+            This function calls itself every 1 sec and appends the gpu_memory.
+        """
+        self.timer = Timer(1.0, self.get_status_every_sec)
+        self.timer.start()
+        self.gpu_mem.append(get_gpu_memory(gpu_id))
+        # print('self.gpu_mem',self.gpu_mem)
+    
+    def stop_timer(self):
+        self.timer.cancel()
+
+
+def get_mod_id_seg(dir_model):
+    # assume we already know there are seg models - this check is intended to be done prior to calling this function
+    fns = [fn for fn in os.listdir(dir_model) if fn.endswith('.pth') and 'net_G' in fn]
+    
+    if len(fns) == 0: # typically this means the directory only contains serialized models
+        fns = [fn for fn in os.listdir(dir_model) if fn.endswith('.pt') and fn.startswith('G')]
+        model_names = [fn[1:-3] for fn in fns] # 1[:-3] drop ".pt" and the starting G
+    else:
+        model_names = [fn[:-4].split('_')[2][1:] for fn in fns] # [1:] drop "G"
+    
+    if len(fns) == 0:
+        raise Exception('Cannot find any model file ending with .pt or .pth in directory',dir_model)
+    
+    model_name_seg = max(model_names, key=len)
+    return model_name_seg[0]
+
+def get_input_id(dir_model):
+    # assume we already know there are seg models - this check is intended to be done prior to calling this function
+    fns = [fn for fn in os.listdir(dir_model) if fn.endswith('.pth') and 'net_G' in fn]
+    
+    if len(fns) == 0: # typically this means the directory only contains serialized models
+        fns = [fn for fn in os.listdir(dir_model) if fn.endswith('.pt') and fn.startswith('G')]
+        model_names_seg = [fn[2:-3] for fn in fns] # [2:] drop "GS"/"G5"
+    else:
+        model_names_seg = [fn[:-4].split('_')[2][2:] for fn in fns] # [2:] drop "GS"/"G5"
+    
+    if len(fns) == 0:
+        raise Exception('Cannot find any model file ending with .pt or .pth in directory',dir_model)
+      
+    if '0' in model_names_seg:
+        return '0'
+    else:
+        return '1'
+    
+def init_input_and_mod_id(opt, dir_model=None):
+    """
+    Used by model classes to initialize input id and mod id under different situations.
+    """
+    mod_id_seg = None
+    input_id = None
+    
+    if not opt.continue_train and opt.is_train:
+        if hasattr(opt,'mod_id_seg'): # use mod id seg from train opt file if available
+            mod_id_seg = opt.mod_id_seg
+        elif not hasattr(opt,'modalities_names'): # backward compatible with models trained before this param was introduced
+            mod_id_seg = opt.modalities_no + 1 # for original DeepLIIF, modalities_no is 4 and the seg mod id is 5
+        else:
+            mod_id_seg = 'S'
+        
+        if opt.model in ['DeepLIIF','DeepLIIFKD']:
+            input_id = '0'
+    else: # for both continue train and test, we load existing models, so need to obtain seg mod id and input id from filenames
+        if hasattr(opt, 'mod_id_seg'):
+            mod_id_seg = opt.mod_id_seg
+        else:
+            # for contiue-training, extract mod id seg from existing files if not available
+            mod_id_seg = get_mod_id_seg(dir_model if dir_model is not None else os.path.join(opt.checkpoints_dir, opt.name))
+        
+        if opt.model in ['DeepLIIF','DeepLIIFKD']:
+            input_id = get_input_id(dir_model if dir_model is not None else os.path.join(opt.checkpoints_dir, opt.name))
+        
+    return mod_id_seg, input_id
+
+
+import copy
+def map_model_names(model_names,mod_id_seg_source,input_id_source,mod_id_seg_target,input_id_target):
+    """
+    Used for DeepLIIFKD to map model/image names from teacher model to student model,
+    when mod_id_seg and/or input_id is different.
+    """
+    d_res = {}
+    for model_name in model_names:
+        model_name_new = copy.deepcopy(model_name)
+        if len(model_name) > 2 and model_name[1] == mod_id_seg_source:
+            model_name_new = model_name[0]+mod_id_seg_target+model_name[2:] # replace mod id seg
+            if input_id_source != input_id_target: # currently only support 0 or 1 as input_id
+                if int(input_id_target) == 0:
+                    model_name_new = model_name_new[:2] + str(int(model_name_new[2:])-1)
+                else:
+                    model_name_new = model_name_new[:2] + str(int(model_name_new[2:])+1)
+        d_res[model_name] = model_name_new
+    # this is not a model name but the final aggregated segmentation image name
+    # so it cannot be obtained from model names
+    d_res['G'+mod_id_seg_source] = 'G'+mod_id_seg_target
+    return d_res
